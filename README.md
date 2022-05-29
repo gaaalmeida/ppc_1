@@ -1,8 +1,8 @@
 # Trabalho de Programação Paralela e Concorrente I
 Grupo:
-    - Carlos Gabriel
-    - Isaque Almeida
-    - Luís Fernando
+- Carlos Gabriel
+- Isaque Almeida
+- Luís Fernando
 
 Foi utilizado a seguinte lib para ler o arquivo CSV: https://github.com/vincentlaucsb/csv-parser
 
