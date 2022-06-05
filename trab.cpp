@@ -20,6 +20,7 @@
     #pragma execution_character_set( "utf-8" )
 #endif
 
+
 static std::string RESULT_FOLDER = "result";
 static std::string RESULT_EXTENSION = "txt";
 static std::string DATASET = "./datasets/dataset.csv";
@@ -58,11 +59,11 @@ unsigned long long define_buffer_size(const size_t& columns_count) {
 }
 
 std::string gen_filepath(const std::string& filename) {
-    return CURRENT_PATH.string() + "./" + RESULT_FOLDER + "/" + filename + "." + RESULT_EXTENSION;
+    return CURRENT_PATH.string() + "/" + RESULT_FOLDER + "/" + filename + "." + RESULT_EXTENSION;
 }
 
 std::string gen_filepath(const std::string& filename, const std::string& extension) {
-    return CURRENT_PATH.string() + "./" + RESULT_FOLDER + "/" + filename + "." + extension;
+    return CURRENT_PATH.string() + "/" + RESULT_FOLDER + "/" + filename + "." + extension;
 }
 
 void merge_task_alpha(std::vector<std::vector<std::string>*> merge_vec, const std::vector<std::string>& vec, const std::vector<std::unordered_map<std::string, int>>& ids, const size_t& header_size, const std::string& column_name, const int column_id) {
@@ -318,6 +319,8 @@ int main(int argc, char** argv) {
     int CHUNKS_PROCESSED = 0;
     int CHUNKS_TO_PROCESS = (((dataset_size / MAX_BUFFER_SIZE) * 2) != 0) ? ((dataset_size / MAX_BUFFER_SIZE) * 2) : 1;
     std::cout << "PROCESSING..." << std::endl;
+
+    std::filesystem::create_directory("result");
 
     csv::CSVRow row;
     while (reader.read_row(row)) {
