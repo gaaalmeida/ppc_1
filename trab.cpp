@@ -20,11 +20,12 @@
     #pragma execution_character_set( "utf-8" )
 #endif
 
-
 static std::string RESULT_FOLDER = "result";
 static std::string RESULT_EXTENSION = "txt";
 static std::string DATASET = "./datasets/dataset.csv";
-static std::string CURRENT_PATH = std::filesystem::current_path();
+static std::filesystem::path CURRENT_PATH = std::filesystem::current_path();
+static unsigned long long MAX_BUFFER_SIZE = 1000000;
+static int RESERVE_SIZE = 1'500'000;
 
 unsigned long long define_buffer_size(const size_t& columns_count) {
     /*
@@ -40,7 +41,7 @@ unsigned long long define_buffer_size(const size_t& columns_count) {
 
         // No Windows ele retorna a memoria disponivel REAL, para evitar travar por alguma realocação
         // de vetor, é usado 90% da memoria disponivel.
-        return static_cast<unsigned long long>(std::floor(((available_memory * 0.90) / columns_count) / 4));
+        return static_cast<unsigned long long>(std::floor((available_memory * 0.90) / columns_count));
     #endif
     #ifdef __linux__
         unsigned long long pages = sysconf(_SC_PHYS_PAGES);
@@ -52,16 +53,82 @@ unsigned long long define_buffer_size(const size_t& columns_count) {
         // que um programa pode usar sem interferir em outro, não é a memoria disponivel REAL!
         unsigned long long available_memory = available_pages * page_size;
 
-        return static_cast<unsigned long long>(std::floor((available_memory / columns_count)));
+        return static_cast<unsigned long long>(std::floor((available_memory / columns_count) / 4));
     #endif
 }
 
 std::string gen_filepath(const std::string& filename) {
-    return CURRENT_PATH + "/" + RESULT_FOLDER + "/" + filename + "." + RESULT_EXTENSION;
+    return CURRENT_PATH.string() + "./" + RESULT_FOLDER + "/" + filename + "." + RESULT_EXTENSION;
 }
 
 std::string gen_filepath(const std::string& filename, const std::string& extension) {
-    return CURRENT_PATH + "/" + RESULT_FOLDER + "/" + filename + "." + extension;
+    return CURRENT_PATH.string() + "./" + RESULT_FOLDER + "/" + filename + "." + extension;
+}
+
+void merge_task_alpha(std::vector<std::vector<std::string>*> merge_vec, const std::vector<std::string>& vec, const std::vector<std::unordered_map<std::string, int>>& ids, const size_t& header_size, const std::string& column_name, const int column_id) {
+    const size_t vec_size = vec.size();
+    for (int i = column_id; i < vec_size; i += header_size) {
+        const auto& tmp = ids[column_id].find(vec[i]);
+        #pragma omp critical
+        {
+            (*merge_vec[column_id]).emplace_back(std::to_string(tmp->second));
+        }
+    }
+}
+
+void merge_task_numeric(std::vector<std::vector<std::string>*> merge_vec, const std::vector<std::string>& vec, const std::vector<std::unordered_map<std::string, int>>& ids, const size_t& header_size, const std::string& column_name, const int column_id) {
+    const size_t vec_size = vec.size();
+    #pragma omp parallel for
+    for (int i = column_id; i < vec_size; i += header_size) {
+        #pragma omp critical
+        {
+            (*merge_vec[column_id]).emplace_back(vec[i]);
+        }
+    }
+}
+
+void write_to_merged_file(std::vector<std::vector<std::string>*> merge_vec, const std::string& merged_file_name, const std::map<int, std::string>& dtypes, const std::vector<std::string>& vec, const std::vector<std::unordered_map<std::string, int>>& ids, const std::vector<std::string>& header) {
+    std::ofstream combined_file;
+    combined_file.open(gen_filepath(merged_file_name, "csv"), std::ios_base::app);
+    const size_t vec_size = vec.size();
+    const size_t header_size = header.size();
+    int col = 0;
+    for (int row = 0; row < vec_size; row += header_size) {
+        for (col = 0; col < header_size; col++) {
+            (col == header_size - 1)
+                ? combined_file << (*merge_vec[col])[row / header_size]
+                : combined_file << (*merge_vec[col])[row / header_size] << ",";
+        }
+        combined_file << '\n';
+    }
+}
+
+void merge_tasks(std::vector<std::vector<std::string>*> merge_vec, const std::string& merged_file_name, const std::map<int, std::string>& dtypes, const std::vector<std::string>& vec, const std::vector<std::unordered_map<std::string, int>>& ids, const std::vector<std::string>& header) {
+    /*
+    * Cria uma thread(omp task) para cada coluna com base no seu tipo
+    */
+    const size_t& header_size = header.size();
+    #pragma omp parallel
+    {
+        #pragma omp single
+        for (const auto& [id, type] : dtypes) {
+            if (type == "alpha") {
+                #pragma omp task
+                {
+                    merge_task_alpha(merge_vec, vec, ids, header_size, type, id);
+                }
+                continue;
+            }
+            #pragma omp task
+            merge_task_numeric(merge_vec, vec, ids, header_size, type, id);
+        }
+    }
+}
+
+void clear_vec(std::vector<std::vector<std::string>*> merge_vec) {
+    for (auto& vec : merge_vec) {
+        (*vec).clear();
+    }
 }
 
 void merge(const std::string& merged_file_name, const std::map<int, std::string>& dtypes, const std::vector<std::unordered_map<std::string, int>>& ids, const std::vector<std::string>& header) {
@@ -69,11 +136,22 @@ void merge(const std::string& merged_file_name, const std::map<int, std::string>
     * Junta os dados computados em arquivos separados de cada coluna e cria um arquivo final
     * com todos os dados categorizados com base nos id's criados nos arquivos separados.
     */
+    csv::CSVReader reader(DATASET);
     std::ofstream combined_file;
     combined_file.open(gen_filepath(merged_file_name, "csv"), std::ios_base::app);
-    csv::CSVReader reader(DATASET);
     size_t header_size = header.size();
+    std::vector<std::vector<std::string>*> merge_vec;
+
+    for (int i = 0; i < header_size; i++) {
+        auto* tmp = new std::vector<std::string>;
+        (*tmp).reserve(RESERVE_SIZE);
+        merge_vec.emplace_back(tmp);
+    }
+
+    std::vector<std::string> vec;
+    vec.reserve(RESERVE_SIZE);
     int idx = 0;
+    unsigned long long CURRENT_BUFFER_SIZE = 0;
 
     // Insere os nomes das colunas no arquivo final
     for (const auto& val : reader.get_col_names()) {
@@ -86,28 +164,28 @@ void merge(const std::string& merged_file_name, const std::map<int, std::string>
         combined_file << val << '\n';
     }
 
-    idx = 0;
+    combined_file.close();
 
-    // Le o arquivo original, comparando os valores com os valores computados na fase anterior
-    for (const auto& row : reader) {
-        for (auto& field : row) {
-            if (dtypes.find(idx)->second == "numeric") {
-                (idx != header_size - 1)
-                    ? combined_file << field.get<csv::string_view>() << ","
-                    : combined_file << field.get<csv::string_view>();
-                idx++;
-                continue;
-            }
-            (idx != header_size - 1)
-                ? combined_file << ids[idx].find(field.get<>())->second << ","
-                : combined_file << ids[idx].find(field.get<>())->second;
-            idx++;
+    csv::CSVRow row;
+    while (reader.read_row(row)) {
+        if (((CURRENT_BUFFER_SIZE * 4) + row.size()) > MAX_BUFFER_SIZE) {
+            merge_tasks(merge_vec, merged_file_name, dtypes, vec, ids, header);
+            write_to_merged_file(merge_vec, merged_file_name, dtypes, vec, ids, header);
+            vec.clear();
+            clear_vec(merge_vec);
+            CURRENT_BUFFER_SIZE = 0;
         }
-        idx = 0;
-        combined_file << std::endl;
+
+        CURRENT_BUFFER_SIZE += row.size() * 4;
+        for (csv::CSVField& f : row) {
+            vec.emplace_back(f.get<>());
+        }
     }
 
-    combined_file.close();
+    if (reader.eof() && CURRENT_BUFFER_SIZE != 0) {
+        merge_tasks(merge_vec, merged_file_name, dtypes, vec, ids, header);
+        write_to_merged_file(merge_vec, merged_file_name, dtypes, vec, ids, header);
+    }
 }
 
 void process_alpha(const std::vector<std::string>& vec, std::vector<std::unordered_map<std::string, int>>& ids, const std::vector<std::string>& header, const int column_id) {
@@ -122,7 +200,6 @@ void process_alpha(const std::vector<std::string>& vec, std::vector<std::unorder
     for (int j = column_id; j < vec.size(); j += header_size) {
         // Verifica se o valor já foi computado no map
         // se sim, o ignora e vai para a proxima iteração
-        // ids[column_id].contains(vec[j]) <- C++20
         if (ids[column_id].find(vec[j]) != ids[column_id].end()) {
             continue;
         }
@@ -142,7 +219,7 @@ void process_numeric(const std::vector<std::string>& vec, const std::vector<std:
     * separado.
     */
     std::ofstream file;
-    file.open(gen_filepath(header[column_id]), std::ios::app);
+    file.open(gen_filepath(header[column_id]), std::ios_base::app);
     int header_size = header.size();
 
     #pragma omp parallel for
@@ -159,16 +236,16 @@ void create_process_tasks(const std::map<int, std::string>& dtypes, const std::v
     #pragma omp parallel
     {
         #pragma omp single
-        for (const auto& pair : dtypes) {
-            if (pair.second == "alpha") {
+        for (const auto& [id, type] : dtypes) {
+            if (type == "alpha") {
                 #pragma omp task
                 {
-                    process_alpha(vec, ids, header, pair.first);
+                    process_alpha(vec, ids, header, id);
                 }
                 continue;
             }
             #pragma omp task
-            process_numeric(vec, header, pair.first);
+            process_numeric(vec, header, id);
         }
     }
 }
@@ -222,7 +299,7 @@ int main(int argc, char** argv) {
     std::vector<std::unordered_map<std::string, int>> ids;
     std::map<int, std::string> dtypes;
 
-    vec.reserve(1'500'000);
+    vec.reserve(RESERVE_SIZE);
 
     csv::CSVReader reader(DATASET);
 
@@ -236,7 +313,7 @@ int main(int argc, char** argv) {
 
     unsigned long long CURRENT_BUFFER_SIZE = 0;
     assert(header.size() != 0);
-    unsigned long long MAX_BUFFER_SIZE = define_buffer_size(header.size());
+    MAX_BUFFER_SIZE = define_buffer_size(header.size());
 
     int CHUNKS_PROCESSED = 0;
     int CHUNKS_TO_PROCESS = (((dataset_size / MAX_BUFFER_SIZE) * 2) != 0) ? ((dataset_size / MAX_BUFFER_SIZE) * 2) : 1;
